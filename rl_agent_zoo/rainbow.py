@@ -2,16 +2,81 @@ import torch
 import torch.optim as optim
 import numpy as np
 import gymnasium as gym 
-from typing import Any, Tuple, List, Dict
+import torch.nn as nn
+from typing import Optional, Tuple, List, Dict
 from torch.nn.utils import clip_grad_norm_
-from rainbow_dqn.layer import Network
-from rainbow_dqn.replay_buffer import ReplayBuffer
-from rainbow_dqn.prioritized_buffer import PrioritizedReplayBuffer
+import torch.nn.functional as F
+
 import matplotlib.pyplot as plt
+from rl_agent_zoo.components.layer import NoisyLinear
+from rl_agent_zoo.components.replay_buffer import ReplayBuffer
+from rl_agent_zoo.components.prioritized_buffer import PrioritizedReplayBuffer
 
 
+Transition = Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]
 
-class DQNAgent:
+class RainbowDqnAgentNetwork(nn.Module):
+    def __init__(
+        self, 
+        in_dim: int, 
+        out_dim: int, 
+        atom_size: int, 
+        support: torch.Tensor
+    ):
+        """Initialization."""
+        super(RainbowDqnAgentNetwork, self).__init__()
+        
+        self.support = support
+        self.out_dim = out_dim
+        self.atom_size = atom_size
+
+        # set common feature layer
+        self.feature_layer = nn.Sequential(
+            nn.Linear(in_dim, 128), 
+            nn.ReLU(),
+        )
+        
+        # set advantage layer
+        self.advantage_hidden_layer = NoisyLinear(128, 128)
+        self.advantage_layer = NoisyLinear(128, out_dim * atom_size)
+
+        # set value layer
+        self.value_hidden_layer = NoisyLinear(128, 128)
+        self.value_layer = NoisyLinear(128, atom_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward method implementation."""
+        dist = self.dist(x)
+        q = torch.sum(dist * self.support, dim=2)
+        
+        return q
+    
+    def dist(self, x: torch.Tensor) -> torch.Tensor:
+        """Get distribution for atoms."""
+        feature = self.feature_layer(x)
+        adv_hid = F.relu(self.advantage_hidden_layer(feature))
+        val_hid = F.relu(self.value_hidden_layer(feature))
+        
+        advantage = self.advantage_layer(adv_hid).view(
+            -1, self.out_dim, self.atom_size
+        )
+        value = self.value_layer(val_hid).view(-1, 1, self.atom_size)
+        q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
+        
+        dist = F.softmax(q_atoms, dim=-1)
+        dist = dist.clamp(min=1e-3)  # for avoiding nans
+        
+        return dist
+    
+    def reset_noise(self):
+        """Reset all noisy layers."""
+        self.advantage_hidden_layer.reset_noise()
+        self.advantage_layer.reset_noise()
+        self.value_hidden_layer.reset_noise()
+        self.value_layer.reset_noise()
+
+
+class RainbowDqnAgent:
     """DQN Agent interacting with environment.
     
     Attribute:
@@ -84,7 +149,6 @@ class DQNAgent:
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-        print(self.device)
         
         # PER
         # memory for 1-step Learning
@@ -111,10 +175,10 @@ class DQNAgent:
         ).to(self.device)
 
         # networks: dqn, dqn_target
-        self.dqn = Network(
+        self.dqn = RainbowDqnAgentNetwork(
             obs_dim, action_dim, self.atom_size, self.support
         ).to(self.device)
-        self.dqn_target = Network(
+        self.dqn_target = RainbowDqnAgentNetwork(
             obs_dim, action_dim, self.atom_size, self.support
         ).to(self.device)
         self.dqn_target.load_state_dict(self.dqn.state_dict())
@@ -124,46 +188,49 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.dqn.parameters())
 
         # transition to store in memory
-        self.transition: List[Any] = list()
-        
+        self.transition: Optional[Transition] = None # (state, action, reward, next_state, done)
+            
         # mode: train / test
         self.is_test = False
-
+        
     def select_action(self, state: np.ndarray) -> np.ndarray:
-        """Select an action from the input state."""
-        # NoisyNet: no epsilon greedy action selection
         selected_action = self.dqn(
             torch.FloatTensor(state).to(self.device)
         ).argmax()
         selected_action = selected_action.detach().cpu().numpy()
         
         if not self.is_test:
-            self.transition = [state, selected_action]
+            # Instead of storing a list, store as a tuple part
+            self._partial_transition = (state, selected_action)
         
         return selected_action
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
-        """Take an action and return the response of the env."""
         next_state, reward, terminated, truncated, _ = self.env.step(action)
         done = terminated or truncated
         
         if not self.is_test:
-            self.transition += [reward, next_state, done]
+            # Combine with the stored partial transition to build a full transition
+            full_transition: Transition = (*self._partial_transition, float(reward), next_state, done)
             
             # N-step transition
             if self.use_n_step:
-                one_step_transition = self.memory_n.store(*self.transition)
-            # 1-step transition
+                one_step_transition = self.memory_n.store(*full_transition)
             else:
-                one_step_transition = self.transition 
+                one_step_transition = full_transition
 
-            # add a single step transition
             if one_step_transition:
-                self.memory.store(*one_step_transition)
+                self.memory.store(
+                    obs=one_step_transition[0],
+                    act=one_step_transition[1],
+                    rew=one_step_transition[2],
+                    next_obs=one_step_transition[3],
+                    done=one_step_transition[4],
+                )
+        
+        return next_state, reward, done # type: ignore
     
-        return next_state, reward, done
-
-    def update_model(self) -> torch.Tensor:
+    def update_model(self) -> float:
         """Update the model by gradient descent."""
         # PER needs beta to calculate weights
         samples = self.memory.sample_batch(self.beta)
@@ -199,7 +266,7 @@ class DQNAgent:
         loss_for_prior = elementwise_loss.detach().cpu().numpy()
         new_priorities = loss_for_prior + self.prior_eps
         self.memory.update_priorities(indices, new_priorities)
-        
+               
         # NoisyNet: reset noise
         self.dqn.reset_noise()
         self.dqn_target.reset_noise()
@@ -214,14 +281,14 @@ class DQNAgent:
         update_cnt = 0
         losses = []
         scores = []
-        score = 0
+        score = 0.0
 
         for frame_idx in range(1, num_frames + 1):
             action = self.select_action(state)
             next_state, reward, done = self.step(action)
 
             state = next_state
-            score += reward
+            score += float(reward)
             
             # NoisyNet: removed decrease of epsilon
             
@@ -260,14 +327,14 @@ class DQNAgent:
         
         state, _ = self.env.reset(seed=self.seed)
         done = False
-        score = 0
+        score: float = 0.0
         
         while not done:
             action = self.select_action(state)
             next_state, reward, done = self.step(action)
 
             state = next_state
-            score += reward
+            score += float(reward)
         
         print("score: ", score)
         self.env.close()

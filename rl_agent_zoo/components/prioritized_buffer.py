@@ -2,8 +2,8 @@ import random
 from typing import List, Tuple, Dict
 import numpy as np
 
-from rainbow_dqn.replay_buffer import ReplayBuffer
-from rainbow_dqn.segment_tree import MinSegmentTree, SumSegmentTree
+from rl_agent_zoo.components.replay_buffer import ReplayBuffer
+from rl_agent_zoo.components.segment_tree import MinSegmentTree, SumSegmentTree
 
 
 class PrioritizedReplayBuffer(ReplayBuffer):
@@ -47,7 +47,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
     def store(
         self, 
         obs: np.ndarray, 
-        act: int, # type: ignore
+        act: float | np.ndarray, # type: ignore
         rew: float, 
         next_obs: np.ndarray, 
         done: bool,
@@ -86,7 +86,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             indices=indices, # type: ignore
         )
         
-    def update_priorities(self, indices: List[int], priorities: np.ndarray):
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
         """Update priorities of sampled transitions."""
         assert len(indices) == len(priorities)
 
